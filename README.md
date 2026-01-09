@@ -1,6 +1,6 @@
 # Rusty-Swag
 
-A Rust tool for discovering and testing Swagger/OpenAPI specifications. Automatically finds API endpoints, detects PII exposure, tests endpoints for basic function as defined by the YAML (*With custom headers as potentially necessary from WebApp), and generates sample HTTP requests from identified specifications. Provides a bit more flexibility to usage with other tools where using Burp's OpenAPI Extension isn't viable.
+A Rust tool for discovering and testing Swagger/OpenAPI specifications. Automatically finds API endpoints, detects PII exposure, tests endpoints for basic function as defined by the YAML (*With custom headers as potentially necessary from WebApp), and generates sample HTTP requests from identified specifications. Provides a bit more flexibility to usage with other tools where using Burp's OpenAPI Extension isn't viable. This was written quick and in a weekend, and is by no means perfect but useful for CTFs or generating requests on the fly.
 
 ## Installation
 
