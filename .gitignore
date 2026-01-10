@@ -1,0 +1,19 @@
+# Build artifacts
+/target/
+
+# Cargo lock file (optional for binaries, exclude if you want reproducible builds)
+Cargo.lock
+
+# IDE/editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Sample output directory
+swagger-samples/
