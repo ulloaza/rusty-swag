@@ -70,6 +70,21 @@ struct Args {
     /// Directory to save individual HTTP request files (default: "swagger-samples")
     #[arg(long, default_value = "swagger-samples")]
     samples_dir: String,
+
+    /// Enable brute force testing of parameters with common values
+    /// Tests URL query parameters and POST body fields with multiple payloads
+    #[arg(short = 'b', long)]
+    brute: bool,
+
+    /// Custom wordlist file for brute force testing (one value per line)
+    /// If not specified, uses built-in common test values
+    #[arg(long, value_name = "FILE")]
+    wordlist: Option<String>,
+
+    /// Maximum number of brute force combinations per endpoint (default: 100)
+    /// Helps prevent excessive requests on endpoints with many parameters
+    #[arg(long, default_value = "100")]
+    brute_limit: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +223,135 @@ struct ScanStats {
     proxy_used: bool,
 }
 
+#[derive(Debug, Clone)]
+struct BruteConfig {
+    enabled: bool,
+    values: Vec<String>,
+    limit: usize,
+}
+
+impl BruteConfig {
+    fn new(enabled: bool, wordlist_path: Option<String>, limit: usize) -> Self {
+        let values = if enabled {
+            if let Some(path) = wordlist_path {
+                // Load wordlist from file
+                match fs::read_to_string(&path) {
+                    Ok(content) => content.lines()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty() && !s.starts_with('#'))
+                        .collect(),
+                    Err(e) => {
+                        eprintln!("[WARN] Failed to load wordlist {}: {}, using defaults", path, e);
+                        Self::default_values()
+                    }
+                }
+            } else {
+                Self::default_values()
+            }
+        } else {
+            Vec::new()
+        };
+
+        BruteConfig { enabled, values, limit }
+    }
+
+    fn default_values() -> Vec<String> {
+        vec![
+            // Common IDs
+            "1".to_string(),
+            "0".to_string(),
+            "-1".to_string(),
+            "2".to_string(),
+            "100".to_string(),
+            "999".to_string(),
+            "9999".to_string(),
+            // Common strings
+            "admin".to_string(),
+            "test".to_string(),
+            "user".to_string(),
+            "guest".to_string(),
+            "root".to_string(),
+            "null".to_string(),
+            "undefined".to_string(),
+            // SQL injection probes
+            "'".to_string(),
+            "\"".to_string(),
+            "1'--".to_string(),
+            "1 OR 1=1".to_string(),
+            "' OR '1'='1".to_string(),
+            // Path traversal
+            "../".to_string(),
+            "..%2f".to_string(),
+            "....//....//".to_string(),
+            // XSS probes
+            "<script>alert(1)</script>".to_string(),
+            "<img src=x onerror=alert(1)>".to_string(),
+            "javascript:alert(1)".to_string(),
+            // SSTI probes
+            "{{7*7}}".to_string(),
+            "${7*7}".to_string(),
+            "<%= 7*7 %>".to_string(),
+            // Command injection
+            "; ls".to_string(),
+            "| cat /etc/passwd".to_string(),
+            "`id`".to_string(),
+            "$(id)".to_string(),
+            // Boolean values
+            "true".to_string(),
+            "false".to_string(),
+            // Empty/special
+            "".to_string(),
+            " ".to_string(),
+            "%00".to_string(),
+            "%0a".to_string(),
+            // UUIDs
+            "00000000-0000-0000-0000-000000000000".to_string(),
+            // Large numbers
+            "999999999999".to_string(),
+            "-999999999999".to_string(),
+        ]
+    }
+
+    fn get_values_for_type(&self, param_type: Option<&str>) -> Vec<String> {
+        if !self.enabled {
+            return Vec::new();
+        }
+
+        match param_type {
+            Some("integer") | Some("number") => {
+                self.values.iter()
+                    .filter(|v| v.parse::<i64>().is_ok() || v.contains("'") || v.contains("OR"))
+                    .cloned()
+                    .collect()
+            }
+            Some("boolean") => vec![
+                "true".to_string(),
+                "false".to_string(),
+                "1".to_string(),
+                "0".to_string(),
+                "yes".to_string(),
+                "no".to_string(),
+            ],
+            _ => self.values.clone(),
+        }
+    }
+}
+
+/// Type alias for query parameter combinations used in brute forcing
+type QueryParamCombos = Vec<(String, String)>;
+
+/// Type alias for brute force test combinations (query params, optional body)
+type BruteCombination = (QueryParamCombos, Option<Value>);
+
+/// Type alias for PII detection results
+type PiiDetectionResult = (
+    bool,
+    Option<HashMap<String, Vec<String>>>,
+    Option<HashMap<String, DetectionDetails>>,
+    HashMap<String, String>,
+    HashSet<String>,
+);
+
 struct Scanner {
     client: Client,
     verbose: bool,
@@ -216,10 +360,11 @@ struct Scanner {
     total_requests: Arc<Mutex<u64>>,
     scan_start: Instant,
     custom_headers: HashMap<String, String>,
+    brute_config: BruteConfig,
 }
 
 impl Scanner {
-    fn new(verbose: bool, rate: u64, custom_headers: HashMap<String, String>, proxy_url: Option<String>) -> Self {
+    fn new(verbose: bool, rate: u64, custom_headers: HashMap<String, String>, proxy_url: Option<String>, brute_config: BruteConfig) -> Self {
         // Ensure rate is at least 1 to avoid division by zero
         let rate = rate.max(1);
 
@@ -232,7 +377,7 @@ impl Scanner {
             if verbose {
                 println!("[INFO] Configuring proxy: {}", proxy);
             }
-            
+
             match reqwest::Proxy::all(proxy) {
                 Ok(proxy_config) => {
                     client_builder = client_builder.proxy(proxy_config);
@@ -250,6 +395,11 @@ impl Scanner {
             .build()
             .expect("Failed to build HTTP client");
 
+        if brute_config.enabled && verbose {
+            println!("[INFO] Brute force mode enabled with {} test values (limit: {} per endpoint)",
+                brute_config.values.len(), brute_config.limit);
+        }
+
         Scanner {
             client,
             verbose,
@@ -258,6 +408,7 @@ impl Scanner {
             total_requests: Arc::new(Mutex::new(0)),
             scan_start: Instant::now(),
             custom_headers,
+            brute_config,
         }
     }
 
@@ -270,6 +421,16 @@ impl Scanner {
             None
         };
 
+        // Parse URL first to validate it
+        let parsed_url = match self.parse_url(url) {
+            Ok(u) => u,
+            Err(e) => {
+                eprintln!("[ERROR] Invalid URL {}: {}", url, e);
+                return (results, found_spec, sample_requests);
+            }
+        };
+
+        let full_url = parsed_url.to_string();
         let base_url = match self.normalize_url(url) {
             Ok(u) => u,
             Err(e) => {
@@ -279,26 +440,52 @@ impl Scanner {
         };
 
         if self.verbose {
-            println!("\n[INFO] Processing: {}", base_url);
+            println!("\n[INFO] Processing: {}", full_url);
         }
 
-        // Try to find and fetch the Swagger/OpenAPI spec
+        // Helper closure to process a found spec
+        let process_spec = |spec: &SwaggerSpec, spec_url: &str, base: &str,
+                           sample_requests: &mut Option<Vec<SampleRequest>>| {
+            if !product {
+                println!("[SUCCESS] Found spec at: {}", spec_url);
+            }
+
+            // Generate sample requests if flag is set
+            if samples {
+                if let Some(ref mut requests) = sample_requests {
+                    let new_samples = self.generate_samples(spec, base, risk);
+                    requests.extend(new_samples);
+                }
+            }
+        };
+
+        // If URL looks like a direct spec URL, try it first
+        if self.is_direct_spec_url(&full_url) {
+            if self.verbose {
+                println!("[INFO] URL appears to be a direct spec link, trying it first...");
+            }
+
+            if let Ok(spec) = self.fetch_spec(&full_url).await {
+                found_spec = true;
+                process_spec(&spec, &full_url, &base_url, &mut sample_requests);
+
+                // Test endpoints
+                let endpoint_results = self.test_endpoints(&spec, &base_url, risk, all, product).await;
+                results.extend(endpoint_results);
+
+                return (results, found_spec, sample_requests);
+            } else if self.verbose {
+                println!("[INFO] Direct spec URL failed, falling back to discovery...");
+            }
+        }
+
+        // Try to find and fetch the Swagger/OpenAPI spec from common locations
         let spec_locations = self.get_spec_locations(&base_url);
-        
+
         for spec_url in spec_locations {
             if let Ok(spec) = self.fetch_spec(&spec_url).await {
                 found_spec = true;
-                if !product {
-                    println!("[SUCCESS] Found spec at: {}", spec_url);
-                }
-
-                // Generate sample requests if flag is set
-                if samples {
-                    if let Some(ref mut requests) = sample_requests {
-                        let new_samples = self.generate_samples(&spec, &base_url, risk);
-                        requests.extend(new_samples);
-                    }
-                }
+                process_spec(&spec, &spec_url, &base_url, &mut sample_requests);
 
                 // Test endpoints
                 let endpoint_results = self.test_endpoints(&spec, &base_url, risk, all, product).await;
@@ -327,6 +514,29 @@ impl Scanner {
         parsed.set_fragment(None);
 
         Ok(parsed.to_string().trim_end_matches('/').to_string())
+    }
+
+    /// Check if a URL appears to be a direct link to a spec file
+    fn is_direct_spec_url(&self, url: &str) -> bool {
+        let lower = url.to_lowercase();
+        // Check for common spec file extensions and paths
+        lower.ends_with(".json")
+            || lower.ends_with(".yaml")
+            || lower.ends_with(".yml")
+            || lower.contains("/swagger.json")
+            || lower.contains("/openapi.json")
+            || lower.contains("/api-docs")
+            || lower.contains("/swagger.yaml")
+            || lower.contains("/openapi.yaml")
+    }
+
+    /// Parse a URL, adding scheme if missing
+    fn parse_url(&self, url: &str) -> Result<Url> {
+        if url.starts_with("http://") || url.starts_with("https://") {
+            Ok(Url::parse(url)?)
+        } else {
+            Ok(Url::parse(&format!("https://{}", url))?)
+        }
     }
 
     fn get_spec_locations(&self, base_url: &str) -> Vec<String> {
@@ -442,7 +652,7 @@ impl Scanner {
                     }
 
                     // Generate cURL command
-                    let curl_command = self.generate_curl_command(&method, &full_url, &headers, 
+                    let curl_command = self.generate_curl_command(method, &full_url, &headers,
                         &if query_params.is_empty() { None } else { Some(query_params.clone()) }, &body);
 
                     samples.push(SampleRequest {
@@ -630,6 +840,82 @@ impl Scanner {
         }
     }
 
+    /// Generate parameter value combinations for brute forcing
+    fn generate_brute_combinations(
+        &self,
+        parameters: &Option<Vec<Parameter>>,
+        body_schema: Option<&Schema>,
+    ) -> Vec<BruteCombination> {
+        let mut combinations = Vec::new();
+
+        if !self.brute_config.enabled {
+            return combinations;
+        }
+
+        // Get query parameters that can be brute forced
+        let mut query_params: Vec<(&Parameter, Vec<String>)> = Vec::new();
+        if let Some(params) = parameters {
+            for param in params {
+                if param.location == "query" {
+                    let param_type = param.param_type.as_deref()
+                        .or_else(|| param.schema.as_ref().and_then(|s| s.schema_type.as_deref()));
+                    let values = self.brute_config.get_values_for_type(param_type);
+                    if !values.is_empty() {
+                        query_params.push((param, values));
+                    }
+                }
+            }
+        }
+
+        // Generate query parameter combinations (one param at a time with brute values)
+        for (param, values) in &query_params {
+            for value in values {
+                let combo: Vec<(String, String)> = vec![(param.name.clone(), value.clone())];
+                combinations.push((combo, None));
+
+                if combinations.len() >= self.brute_config.limit {
+                    return combinations;
+                }
+            }
+        }
+
+        // Generate body parameter combinations for POST/PUT/PATCH
+        if let Some(schema) = body_schema {
+            if let Some(properties) = &schema.properties {
+                for (prop_name, prop_schema) in properties {
+                    let prop_type = prop_schema.schema_type.as_deref();
+                    let values = self.brute_config.get_values_for_type(prop_type);
+
+                    for value in values {
+                        // Create a body with just this property set to the brute value
+                        let body_value = match prop_type {
+                            Some("integer") | Some("number") => {
+                                if let Ok(n) = value.parse::<i64>() {
+                                    json!({ prop_name.clone(): n })
+                                } else {
+                                    json!({ prop_name.clone(): value })
+                                }
+                            }
+                            Some("boolean") => {
+                                let bool_val = value == "true" || value == "1" || value == "yes";
+                                json!({ prop_name.clone(): bool_val })
+                            }
+                            _ => json!({ prop_name.clone(): value }),
+                        };
+
+                        combinations.push((Vec::new(), Some(body_value)));
+
+                        if combinations.len() >= self.brute_config.limit {
+                            return combinations;
+                        }
+                    }
+                }
+            }
+        }
+
+        combinations
+    }
+
     async fn test_endpoints(&self, spec: &SwaggerSpec, base_url: &str, risk: bool, _all: bool, _product: bool) -> Vec<TestResult> {
         let mut results = Vec::new();
 
@@ -652,154 +938,201 @@ impl Scanner {
                         continue;
                     }
 
-                    let full_url = format!("{}{}", base_path.trim_end_matches('/'), path);
-                    let client = self.client.clone();
-                    let method_clone = method.clone();
-                    let path_clone = path.clone();
-                    let path_item_clone = path_item.clone();
-                    let rate_limiter = self.rate_limiter.clone();
-                    let verbose = self.verbose;
-                    let custom_headers = self.custom_headers.clone();
-                    let total_requests = self.total_requests.clone();
+                    // Get body schema for brute forcing
+                    let body_schema = path_item.request_body.as_ref()
+                        .and_then(|rb| rb.content.as_ref())
+                        .and_then(|c| c.get("application/json"))
+                        .and_then(|ct| ct.schema.as_ref());
 
-                    let task = tokio::spawn(async move {
-                        let _permit = rate_limiter.acquire().await.unwrap();
+                    // Generate brute force combinations
+                    let brute_combinations = self.generate_brute_combinations(
+                        &path_item.parameters,
+                        body_schema,
+                    );
 
-                        // Build URL with query parameters
-                        let mut url_with_params = full_url.clone();
-                        let mut query_params = Vec::new();
+                    // Create test cases: normal + brute force
+                    let mut test_cases: Vec<(QueryParamCombos, Option<Value>, bool)> = vec![
+                        (Vec::new(), None, false) // Normal test case
+                    ];
 
-                        // Process parameters
-                        if let Some(parameters) = &path_item_clone.parameters {
-                            for param in parameters {
-                                let example_value = if let Some(ex) = &param.example {
-                                    match ex {
-                                        Value::String(s) => s.clone(),
-                                        Value::Number(n) => n.to_string(),
-                                        Value::Bool(b) => b.to_string(),
-                                        _ => "example".to_string(),
+                    // Add brute force test cases
+                    for (query_params, body) in brute_combinations {
+                        test_cases.push((query_params, body, true));
+                    }
+
+                    for (brute_query_params, brute_body, is_brute) in test_cases {
+                        let full_url = format!("{}{}", base_path.trim_end_matches('/'), path);
+                        let client = self.client.clone();
+                        let method_clone = method.clone();
+                        let path_clone = path.clone();
+                        let path_item_clone = path_item.clone();
+                        let rate_limiter = self.rate_limiter.clone();
+                        let rate_delay = self.rate_delay;
+                        let verbose = self.verbose;
+                        let custom_headers = self.custom_headers.clone();
+                        let total_requests = self.total_requests.clone();
+
+                        let task = tokio::spawn(async move {
+                            let _permit = rate_limiter.acquire().await.unwrap();
+
+                            // Apply rate limiting delay before each request
+                            sleep(rate_delay).await;
+
+                            // Build URL with query parameters
+                            let mut url_with_params = full_url.clone();
+                            let mut query_params = Vec::new();
+
+                            // Process normal parameters first
+                            if let Some(parameters) = &path_item_clone.parameters {
+                                for param in parameters {
+                                    if param.location == "query" {
+                                        // Check if this param has a brute force override
+                                        let brute_value = brute_query_params.iter()
+                                            .find(|(name, _)| name == &param.name)
+                                            .map(|(_, v)| v.clone());
+
+                                        let value = brute_value.unwrap_or_else(|| {
+                                            if let Some(ex) = &param.example {
+                                                match ex {
+                                                    Value::String(s) => s.clone(),
+                                                    Value::Number(n) => n.to_string(),
+                                                    Value::Bool(b) => b.to_string(),
+                                                    _ => "example".to_string(),
+                                                }
+                                            } else {
+                                                "example".to_string()
+                                            }
+                                        });
+
+                                        query_params.push((param.name.clone(), value));
                                     }
-                                } else {
-                                    "example".to_string()
-                                };
-
-                                if param.location == "query" {
-                                    query_params.push((param.name.clone(), example_value));
                                 }
                             }
-                        }
 
-                        // Add query parameters to URL
-                        if !query_params.is_empty() {
-                            let query_string: Vec<String> = query_params.iter()
-                                .map(|(k, v)| format!("{}={}",
-                                    urlencoding::encode(k),
-                                    urlencoding::encode(v)))
-                                .collect();
-                            url_with_params.push_str("?");
-                            url_with_params.push_str(&query_string.join("&"));
-                        }
-
-                        let mut request = match method_clone.to_uppercase().as_str() {
-                            "GET" => client.get(&url_with_params),
-                            "POST" => client.post(&url_with_params),
-                            "PUT" => client.put(&url_with_params),
-                            "DELETE" => client.delete(&url_with_params),
-                            "PATCH" => client.patch(&url_with_params),
-                            _ => client.get(&url_with_params),
-                        };
-
-                        let mut body_content = String::new();
-
-                        // Add custom headers
-                        for (key, value) in &custom_headers {
-                            request = request.header(key, value);
-                        }
-
-                        // Add header parameters from spec
-                        if let Some(parameters) = &path_item_clone.parameters {
-                            for param in parameters {
-                                if param.location == "header" {
-                                    let example_value = if let Some(ex) = &param.example {
-                                        match ex {
-                                            Value::String(s) => s.clone(),
-                                            Value::Number(n) => n.to_string(),
-                                            Value::Bool(b) => b.to_string(),
-                                            _ => "example".to_string(),
-                                        }
-                                    } else {
-                                        "example".to_string()
-                                    };
-                                    request = request.header(&param.name, example_value);
-                                }
+                            // Add query parameters to URL
+                            if !query_params.is_empty() {
+                                let query_string: Vec<String> = query_params.iter()
+                                    .map(|(k, v)| format!("{}={}",
+                                        urlencoding::encode(k),
+                                        urlencoding::encode(v)))
+                                    .collect();
+                                url_with_params.push('?');
+                                url_with_params.push_str(&query_string.join("&"));
                             }
-                        }
 
-                        // Add request body for POST/PUT/PATCH
-                        if method_clone.to_uppercase() == "POST" || method_clone.to_uppercase() == "PUT" || method_clone.to_uppercase() == "PATCH" {
-                            if let Some(request_body) = &path_item_clone.request_body {
-                                if let Some(content) = &request_body.content {
-                                    if let Some(json_content) = content.get("application/json") {
-                                        request = request.header("Content-Type", "application/json");
-                                        let example_body = if let Some(ex) = &json_content.example {
-                                            serde_json::to_string(ex).unwrap_or_else(|_| "{}".to_string())
+                            let mut request = match method_clone.to_uppercase().as_str() {
+                                "GET" => client.get(&url_with_params),
+                                "POST" => client.post(&url_with_params),
+                                "PUT" => client.put(&url_with_params),
+                                "DELETE" => client.delete(&url_with_params),
+                                "PATCH" => client.patch(&url_with_params),
+                                _ => client.get(&url_with_params),
+                            };
+
+                            let mut body_content = String::new();
+
+                            // Add custom headers
+                            for (key, value) in &custom_headers {
+                                request = request.header(key, value);
+                            }
+
+                            // Add header parameters from spec
+                            if let Some(parameters) = &path_item_clone.parameters {
+                                for param in parameters {
+                                    if param.location == "header" {
+                                        let example_value = if let Some(ex) = &param.example {
+                                            match ex {
+                                                Value::String(s) => s.clone(),
+                                                Value::Number(n) => n.to_string(),
+                                                Value::Bool(b) => b.to_string(),
+                                                _ => "example".to_string(),
+                                            }
                                         } else {
-                                            "{}".to_string()
+                                            "example".to_string()
                                         };
-                                        body_content = example_body.clone();
-                                        request = request.body(example_body);
+                                        request = request.header(&param.name, example_value);
                                     }
                                 }
                             }
-                        }
 
-                        if verbose {
-                            println!("[TEST] {} {}", method_clone.to_uppercase(), url_with_params);
-                        }
-
-                        match request.send().await {
-                            Ok(response) => {
-                                // Increment request counter after successful send
-                                let mut counter = total_requests.lock().await;
-                                *counter += 1;
-                                drop(counter);
-
-                                let status = response.status().as_u16();
-                                let content_length = response.content_length().unwrap_or(0) as usize;
-
-                                // Parse response for PII detection
-                                let response_text = response.text().await.unwrap_or_default();
-                                let (pii_detected, pii_data, detection_details, patterns_found, detection_methods) =
-                                    Self::detect_pii(&response_text);
-
-                                let interesting = Self::is_interesting_response(&response_text, status);
-
-                                Some(TestResult {
-                                    method: method_clone.to_uppercase(),
-                                    url: url_with_params,
-                                    path_template: path_clone,
-                                    body: body_content,
-                                    status_code: status,
-                                    content_length,
-                                    pii_detected,
-                                    pii_data,
-                                    pii_detection_details: detection_details,
-                                    interesting_response: interesting,
-                                    regex_patterns_found: patterns_found,
-                                    pii_detection_methods: detection_methods,
-                                    custom_headers_used: if custom_headers.is_empty() { None } else { Some(custom_headers) },
-                                })
-                            }
-                            Err(e) => {
-                                if verbose {
-                                    eprintln!("[ERROR] Failed to test {} {}: {}", method_clone, url_with_params, e);
+                            // Add request body for POST/PUT/PATCH
+                            let method_upper = method_clone.to_uppercase();
+                            if method_upper == "POST" || method_upper == "PUT" || method_upper == "PATCH" {
+                                // Use brute force body if provided, otherwise use example
+                                if let Some(brute_body_value) = &brute_body {
+                                    request = request.header("Content-Type", "application/json");
+                                    let body_str = serde_json::to_string(brute_body_value)
+                                        .unwrap_or_else(|_| "{}".to_string());
+                                    body_content = body_str.clone();
+                                    request = request.body(body_str);
+                                } else if let Some(request_body) = &path_item_clone.request_body {
+                                    if let Some(content) = &request_body.content {
+                                        if let Some(json_content) = content.get("application/json") {
+                                            request = request.header("Content-Type", "application/json");
+                                            let example_body = if let Some(ex) = &json_content.example {
+                                                serde_json::to_string(ex).unwrap_or_else(|_| "{}".to_string())
+                                            } else {
+                                                "{}".to_string()
+                                            };
+                                            body_content = example_body.clone();
+                                            request = request.body(example_body);
+                                        }
+                                    }
                                 }
-                                None
                             }
-                        }
-                    });
 
-                    tasks.push(task);
+                            if verbose {
+                                let brute_tag = if is_brute { " [BRUTE]" } else { "" };
+                                println!("[TEST]{} {} {}", brute_tag, method_clone.to_uppercase(), url_with_params);
+                                if !body_content.is_empty() && is_brute {
+                                    println!("       Body: {}", body_content);
+                                }
+                            }
+
+                            match request.send().await {
+                                Ok(response) => {
+                                    // Increment request counter after successful send
+                                    let mut counter = total_requests.lock().await;
+                                    *counter += 1;
+                                    drop(counter);
+
+                                    let status = response.status().as_u16();
+                                    let content_length = response.content_length().unwrap_or(0) as usize;
+
+                                    // Parse response for PII detection
+                                    let response_text = response.text().await.unwrap_or_default();
+                                    let (pii_detected, pii_data, detection_details, patterns_found, detection_methods) =
+                                        Self::detect_pii(&response_text);
+
+                                    let interesting = Self::is_interesting_response(&response_text, status);
+
+                                    Some(TestResult {
+                                        method: method_clone.to_uppercase(),
+                                        url: url_with_params,
+                                        path_template: path_clone,
+                                        body: body_content,
+                                        status_code: status,
+                                        content_length,
+                                        pii_detected,
+                                        pii_data,
+                                        pii_detection_details: detection_details,
+                                        interesting_response: interesting,
+                                        regex_patterns_found: patterns_found,
+                                        pii_detection_methods: detection_methods,
+                                        custom_headers_used: if custom_headers.is_empty() { None } else { Some(custom_headers) },
+                                    })
+                                }
+                                Err(e) => {
+                                    if verbose {
+                                        eprintln!("[ERROR] Failed to test {} {}: {}", method_clone, url_with_params, e);
+                                    }
+                                    None
+                                }
+                            }
+                        });
+
+                        tasks.push(task);
+                    }
                 }
             }
 
@@ -812,13 +1145,10 @@ impl Scanner {
             }
         }
 
-        // Apply rate limiting delay
-        sleep(self.rate_delay).await;
-
         results
     }
 
-    fn detect_pii(text: &str) -> (bool, Option<HashMap<String, Vec<String>>>, Option<HashMap<String, DetectionDetails>>, HashMap<String, String>, HashSet<String>) {
+    fn detect_pii(text: &str) -> PiiDetectionResult {
         let mut pii_data = HashMap::new();
         let mut detection_details = HashMap::new();
         let mut patterns_found = HashMap::new();
@@ -828,7 +1158,7 @@ impl Scanner {
         let patterns = [
             ("email", r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"),
             ("phone", r"(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}"),
-            ("ssn", r"\d{3}-\d{2}-\d{4}|\d{9}"),
+            ("ssn", r"\b\d{3}-\d{2}-\d{4}\b"),
             ("credit_card", r"\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}"),
             ("ipv4", r"\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b"),
             ("ipv6", r"(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}"),
@@ -1156,7 +1486,15 @@ async fn main() -> Result<()> {
         }
     }
 
-    let scanner = Scanner::new(args.verbose, args.rate, custom_headers.clone(), args.proxy.clone());
+    // Create brute force configuration
+    let brute_config = BruteConfig::new(args.brute, args.wordlist.clone(), args.brute_limit);
+
+    if args.brute && !args.product {
+        println!("[INFO] Brute force mode enabled with {} payloads (limit: {} per endpoint)",
+            brute_config.values.len(), brute_config.limit);
+    }
+
+    let scanner = Scanner::new(args.verbose, args.rate, custom_headers.clone(), args.proxy.clone(), brute_config);
     let mut all_results = Vec::new();
     let mut all_samples = Vec::new();
     let mut hosts_with_spec = 0;
